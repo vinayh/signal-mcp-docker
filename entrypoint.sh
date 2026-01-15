@@ -1,105 +1,37 @@
 #!/bin/bash
 set -e
 
-DATA_DIR="/data"
-LINKED_FILE="$DATA_DIR/.signal-linked"
+ACCOUNT_FILE="/data/.signal-account"
 
 # Check if already linked
-if [ -f "$LINKED_FILE" ] && [ -n "$(ls -A $DATA_DIR/.local/share/signal-cli/data 2>/dev/null)" ]; then
-    # Read the stored phone number
-    PHONE_NUMBER=$(cat "$LINKED_FILE")
-    echo "Signal account already linked: $PHONE_NUMBER"
-    echo "Starting MCP server on port 8080..."
+if [ -f "$ACCOUNT_FILE" ]; then
+    PHONE_NUMBER=$(cat "$ACCOUNT_FILE")
+    echo "Signal account linked: $PHONE_NUMBER"
     exec python3 -m signal_mcp.main --user-id "$PHONE_NUMBER" --transport sse
 fi
 
-echo "============================================"
-echo "  Signal Device Linking Setup"
-echo "============================================"
+echo "No linked account found. Starting device linking..."
+echo "Scan the QR code with Signal (Settings > Linked Devices)"
 echo ""
-echo "No linked Signal account found."
-echo "Starting device linking process..."
-echo ""
-echo "Generating link URI. Please scan the QR code"
-echo "with your Signal app (Settings > Linked Devices)"
-echo ""
-echo "============================================"
 
-# Create a named pipe to capture the link URI while the command runs
-PIPE_FILE=$(mktemp -u)
-mkfifo "$PIPE_FILE"
+# signal-cli link outputs the URI first, then the phone number on success
+# We capture output, show QR for the URI line, and save the phone number
+signal-cli link --name "signal-mcp-docker" 2>&1 | while read -r line; do
+    if [[ "$line" =~ ^sgnl:// ]]; then
+        qrencode -t ANSIUTF8 "$line"
+        echo ""
+        echo "Waiting for you to scan..."
+    elif [[ "$line" =~ ^\+[0-9]+ ]]; then
+        echo "$line" > "$ACCOUNT_FILE"
+        echo "Linked as: $line"
+    fi
+done
 
-# Run signal-cli link in background, output to pipe
-signal-cli link --name "signal-mcp-docker" > "$PIPE_FILE" 2>&1 &
-LINK_PID=$!
-
-# Read the first line (the URI) from the pipe
-read -r LINK_URI < "$PIPE_FILE" || true
-
-# Clean up pipe
-rm -f "$PIPE_FILE"
-
-if [ -z "$LINK_URI" ] || [[ ! "$LINK_URI" =~ ^sgnl:// ]]; then
-    echo "Error: Could not generate link URI"
-    echo "Output was: $LINK_URI"
-    kill $LINK_PID 2>/dev/null || true
-    exit 1
-fi
-
-echo ""
-echo "Link URI:"
-echo "$LINK_URI"
-echo ""
-echo "QR Code (scan with Signal app):"
-echo ""
-qrencode -t ANSIUTF8 "$LINK_URI"
-echo ""
-echo "============================================"
-echo "Waiting for you to scan the QR code..."
-echo "Press Ctrl+C to cancel"
-echo "============================================"
-
-# Wait for the link command to complete
-wait $LINK_PID
-LINK_EXIT=$?
-
-if [ $LINK_EXIT -ne 0 ]; then
-    echo "Linking failed or was cancelled"
-    exit 1
-fi
-
-# After linking, we need to get the account number
-echo ""
-echo "Checking linked accounts..."
-
-# List accounts to find the linked one
-ACCOUNTS=$(signal-cli listAccounts 2>/dev/null || echo "")
-
-if [ -z "$ACCOUNTS" ]; then
-    echo ""
-    echo "Please enter your Signal phone number (e.g., +1234567890):"
-    read -r PHONE_NUMBER
+# Start the MCP server
+if [ -f "$ACCOUNT_FILE" ]; then
+    PHONE_NUMBER=$(cat "$ACCOUNT_FILE")
+    exec python3 -m signal_mcp.main --user-id "$PHONE_NUMBER" --transport sse
 else
-    PHONE_NUMBER=$(echo "$ACCOUNTS" | head -1)
-    echo "Found account: $PHONE_NUMBER"
-fi
-
-# Validate phone number format
-if [[ ! "$PHONE_NUMBER" =~ ^\+[0-9]+$ ]]; then
-    echo "Error: Invalid phone number format. Must be in international format (e.g., +1234567890)"
+    echo "Linking failed"
     exit 1
 fi
-
-# Store the phone number for future runs
-echo "$PHONE_NUMBER" > "$LINKED_FILE"
-
-echo ""
-echo "============================================"
-echo "  Setup Complete!"
-echo "============================================"
-echo ""
-echo "Account linked: $PHONE_NUMBER"
-echo "Starting MCP server on port 8080..."
-echo ""
-
-exec python3 -m signal_mcp.main --user-id "$PHONE_NUMBER" --transport sse
